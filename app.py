@@ -508,8 +508,7 @@ def main(source: str):
 
         check_pose_cues(coords_ref, coords_you)
 
-        # ── Draw skeletons onto frames (OpenCV) ─────────────────────────────────
-        draw_skeleton(frame_vid, lm_vid)
+        # ── Draw skeleton only on learner's webcam frame ────────────────────────
         draw_skeleton(frame_cam, lm_cam, coords_you, coords_ref)
 
         # ── Convert both frames → one pygame surface (single conversion) ───────
