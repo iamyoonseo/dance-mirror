@@ -3,3 +3,4 @@ __pycache__/
 *.task
 /tmp/
 *.mp4
+.cache/

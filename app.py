@@ -15,6 +15,7 @@ Controls:
 
 import sys, os, time, threading, subprocess
 from collections import deque, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -445,9 +446,18 @@ def resolve_video(source: str) -> str:
     if not YTDLP_OK:
         sys.exit("[ERROR] yt-dlp not installed. Run: pip install yt-dlp")
 
-    import tempfile
-    out_dir  = tempfile.mkdtemp()
-    out_tmpl = os.path.join(out_dir, "dance.%(ext)s")
+    # Cache downloads in the project folder so we don't re-download each run
+    cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    import hashlib
+    url_hash  = hashlib.md5(source.encode()).hexdigest()[:10]
+    cached    = os.path.join(cache_dir, f"{url_hash}.mp4")
+    if os.path.exists(cached):
+        print(f"Using cached video: {cached}")
+        return cached
+
+    out_dir  = cache_dir
+    out_tmpl = os.path.join(out_dir, f"{url_hash}.%(ext)s")
     opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": out_tmpl,
@@ -462,7 +472,9 @@ def resolve_video(source: str) -> str:
             path = path.replace(ext, ".mp4")
     if not os.path.exists(path):
         for f in os.listdir(out_dir):
-            path = os.path.join(out_dir, f); break
+            candidate = os.path.join(out_dir, f)
+            if url_hash in f:
+                path = candidate; break
     print(f"Saved to: {path}")
     return path
 
@@ -533,9 +545,18 @@ def main(source: str):
 
         current_sec = cap_vid.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        # ── Pose detection ──────────────────────────────────────────────────────
-        lm_vid = detect(det_vid, cv2.cvtColor(frame_vid, cv2.COLOR_BGR2RGB))
-        lm_cam = detect(det_cam, cv2.cvtColor(frame_cam, cv2.COLOR_BGR2RGB))
+        # ── Pose detection (parallel + downscaled for speed) ────────────────────
+        DETECT_W = 640
+        def prep(bgr):
+            h, w = bgr.shape[:2]
+            small = cv2.resize(bgr, (DETECT_W, int(h * DETECT_W / w)))
+            return cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_vid = ex.submit(detect, det_vid, prep(frame_vid))
+            fut_cam = ex.submit(detect, det_cam, prep(frame_cam))
+            lm_vid  = fut_vid.result()
+            lm_cam  = fut_cam.result()
 
         vec_ref, coords_ref = normalise(lm_vid)
         vec_you, coords_you = normalise(lm_cam)
