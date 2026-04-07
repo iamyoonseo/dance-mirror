@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.task
+/tmp/
+*.mp4
