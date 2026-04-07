@@ -1,16 +1,16 @@
 """
-Dance Mirror — real-time dance coaching with pose comparison, beat scoring,
-and AI feedback.
+Dance Mirror — real-time dance coaching with pose comparison and AI feedback.
+Display framework mirrors the flappy bird project (pygame + clock.tick).
 
 Usage:
     python app.py <video.mp4>
     python app.py <YouTube URL>
 
 Controls:
-    q  quit
-    r  restart video
-    p  pause / resume
-    c  request AI coach feedback
+    q / ESC  quit
+    r        restart video
+    p        pause / resume
+    c        request AI coach feedback
 """
 
 import sys, os, time, threading, subprocess
@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
+import pygame
 import mediapipe as mp
 
 # ── optional deps ──────────────────────────────────────────────────────────────
@@ -27,14 +28,12 @@ try:
     LIBROSA_OK = True
 except ImportError:
     LIBROSA_OK = False
-    print("[WARN] librosa not found — rhythm scoring disabled")
 
 try:
     import ollama as _ollama
     OLLAMA_OK = True
 except ImportError:
     OLLAMA_OK = False
-    print("[WARN] ollama not found — AI coach disabled")
 
 try:
     import yt_dlp
@@ -42,14 +41,14 @@ try:
 except ImportError:
     YTDLP_OK = False
 
-# ── MediaPipe Tasks setup ──────────────────────────────────────────────────────
-MODEL_PATH   = os.path.join(os.path.dirname(__file__), "pose_landmarker_lite.task")
-OLLAMA_MODEL = "llama3.2"
+# ── MediaPipe Tasks ────────────────────────────────────────────────────────────
+MODEL_PATH     = os.path.join(os.path.dirname(__file__), "pose_landmarker_lite.task")
+OLLAMA_MODEL   = "llama3.2"
 
-BaseOptions      = mp.tasks.BaseOptions
-PoseLandmarker   = mp.tasks.vision.PoseLandmarker
+BaseOptions        = mp.tasks.BaseOptions
+PoseLandmarker     = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOpts = mp.tasks.vision.PoseLandmarkerOptions
-RunningMode      = mp.tasks.vision.RunningMode
+RunningMode        = mp.tasks.vision.RunningMode
 
 def make_detector():
     opts = PoseLandmarkerOpts(
@@ -62,53 +61,49 @@ def make_detector():
     )
     return PoseLandmarker.create_from_options(opts)
 
-_detect_ts = 0   # shared monotonic timestamp counter (ms)
-_detect_lock = threading.Lock()
+_ts_lock = threading.Lock()
+_ts_ms   = 0
 
 def detect(detector, rgb_frame):
-    """Run pose detection using VIDEO mode with monotonic timestamps."""
-    global _detect_ts
+    global _ts_ms
     mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-    with _detect_lock:
-        _detect_ts += 33   # ~30fps in ms
-        ts = _detect_ts
+    with _ts_lock:
+        _ts_ms += 33
+        ts = _ts_ms
     result = detector.detect_for_video(mp_img, ts)
-    if result.pose_landmarks:
-        return result.pose_landmarks[0]
-    return None
+    return result.pose_landmarks[0] if result.pose_landmarks else None
 
-# ── Landmark indices (MediaPipe 33-point body model) ──────────────────────────
-L_SHOULDER, R_SHOULDER = 11, 12
-L_ELBOW,    R_ELBOW    = 13, 14
-L_WRIST,    R_WRIST    = 15, 16
-L_HIP,      R_HIP      = 23, 24
-L_KNEE,     R_KNEE     = 25, 26
-L_ANKLE,    R_ANKLE    = 27, 28
+# ── Landmark indices ───────────────────────────────────────────────────────────
+L_SH, R_SH = 11, 12
+L_EL, R_EL = 13, 14
+L_WR, R_WR = 15, 16
+L_HI, R_HI = 23, 24
+L_KN, R_KN = 25, 26
+L_AN, R_AN = 27, 28
 
-KEY_LM = [L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW,
-          L_WRIST, R_WRIST, L_HIP, R_HIP,
-          L_KNEE, R_KNEE, L_ANKLE, R_ANKLE]
+KEY_LM = [L_SH, R_SH, L_EL, R_EL, L_WR, R_WR, L_HI, R_HI, L_KN, R_KN, L_AN, R_AN]
 
 LM_NAMES = {
-    L_SHOULDER: "Left shoulder",  R_SHOULDER: "Right shoulder",
-    L_ELBOW:    "Left elbow",     R_ELBOW:    "Right elbow",
-    L_WRIST:    "Left wrist",     R_WRIST:    "Right wrist",
-    L_HIP:      "Left hip",       R_HIP:      "Right hip",
-    L_KNEE:     "Left knee",      R_KNEE:     "Right knee",
-    L_ANKLE:    "Left ankle",     R_ANKLE:    "Right ankle",
+    L_SH: "Left shoulder",  R_SH: "Right shoulder",
+    L_EL: "Left elbow",     R_EL: "Right elbow",
+    L_WR: "Left wrist",     R_WR: "Right wrist",
+    L_HI: "Left hip",       R_HI: "Right hip",
+    L_KN: "Left knee",      R_KN: "Right knee",
+    L_AN: "Left ankle",     R_AN: "Right ankle",
 }
 
 BODY_CONNECTIONS = [
-    (L_SHOULDER, R_SHOULDER),
-    (L_SHOULDER, L_ELBOW), (L_ELBOW, L_WRIST),
-    (R_SHOULDER, R_ELBOW), (R_ELBOW, R_WRIST),
-    (L_SHOULDER, L_HIP),   (R_SHOULDER, R_HIP),
-    (L_HIP, R_HIP),
-    (L_HIP, L_KNEE), (L_KNEE, L_ANKLE),
-    (R_HIP, R_KNEE), (R_KNEE, R_ANKLE),
+    (L_SH, R_SH),
+    (L_SH, L_EL), (L_EL, L_WR),
+    (R_SH, R_EL), (R_EL, R_WR),
+    (L_SH, L_HI), (R_SH, R_HI),
+    (L_HI, R_HI),
+    (L_HI, L_KN), (L_KN, L_AN),
+    (R_HI, R_KN), (R_KN, R_AN),
 ]
 
 # ── Constants ──────────────────────────────────────────────────────────────────
+TARGET_FPS       = 30
 DISPLAY_H        = 480
 SCORE_SMOOTH     = 20
 AUDIO_COOLDOWN   = 3.5
@@ -117,7 +112,7 @@ VELOCITY_THRESH  = 0.06
 BEAT_WINDOW      = 0.18
 COACH_DISPLAY_SEC = 12
 
-# ── Audio cue (macOS say) ──────────────────────────────────────────────────────
+# ── Audio cue ──────────────────────────────────────────────────────────────────
 _last_cue: dict = {}
 _speak_lock = threading.Lock()
 
@@ -134,31 +129,20 @@ def speak(message: str, key: str) -> None:
 # ── Pose math ──────────────────────────────────────────────────────────────────
 
 def normalise(landmarks):
-    """
-    landmarks: list of NormalizedLandmark (from new MediaPipe Tasks API)
-    Returns (flat_vec, coord_dict) normalised to hip-centre + torso scale.
-    y is image-space (positive = downward), so raised body parts → negative y.
-    """
     if landmarks is None:
         return None, None
-
     def xy(idx):
         return np.array([landmarks[idx].x, landmarks[idx].y], dtype=np.float32)
-
-    hip   = (xy(L_HIP) + xy(R_HIP)) / 2.0
-    scale = np.linalg.norm((xy(L_SHOULDER) + xy(R_SHOULDER)) / 2.0 - hip) + 1e-6
-
+    hip   = (xy(L_HI) + xy(R_HI)) / 2.0
+    scale = np.linalg.norm((xy(L_SH) + xy(R_SH)) / 2.0 - hip) + 1e-6
     coords, flat = {}, []
     for idx in KEY_LM:
         n = (xy(idx) - hip) / scale
         coords[idx] = n
         flat.extend(n)
-
     return np.array(flat, dtype=np.float32), coords
 
-
 def mirror_vec(v: np.ndarray) -> np.ndarray:
-    """Swap left/right pairs and negate x in the flat vector."""
     m = v.copy()
     for i in range(0, len(KEY_LM) - 1, 2):
         lx, ly = i*2, i*2+1
@@ -167,17 +151,13 @@ def mirror_vec(v: np.ndarray) -> np.ndarray:
         m[ly], m[ry] =  v[ry],  v[ly]
     return m
 
-
 def cosine_pct(a, b) -> float:
-    if a is None or b is None:
-        return 0.0
+    if a is None or b is None: return 0.0
     d = np.linalg.norm(a) * np.linalg.norm(b) + 1e-6
     return float(np.clip((np.dot(a, b) / d + 1) / 2 * 100, 0, 100))
 
-
 def best_pose_score(ref, you) -> float:
-    if ref is None or you is None:
-        return 0.0
+    if ref is None or you is None: return 0.0
     return max(cosine_pct(ref, you), cosine_pct(mirror_vec(ref), you))
 
 # ── Beat detection ─────────────────────────────────────────────────────────────
@@ -186,12 +166,12 @@ def load_beats(video_path: str):
     if not LIBROSA_OK:
         return [], 0
     try:
-        print("Analysing audio for beat detection ...", end=" ", flush=True)
+        print("Analysing audio ...", end=" ", flush=True)
         y, sr = librosa.load(video_path, mono=True, sr=None)
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
         beat_times = librosa.frames_to_time(beat_frames, sr=sr)
         bpm = float(np.atleast_1d(tempo)[0])
-        print(f"done  ({bpm:.1f} BPM, {len(beat_times)} beats)")
+        print(f"done  ({bpm:.1f} BPM)")
         return beat_times, bpm
     except Exception as e:
         print(f"failed ({e})")
@@ -201,39 +181,25 @@ def load_beats(video_path: str):
 
 class RhythmTracker:
     def __init__(self, beat_times):
-        self.beat_times   = np.array(beat_times)
-        self.next_beat_i  = 0
-        self.hits         = []
-        self.prev_coords  = None
-        self.last_velocity = 0.0
-        self.beat_flash   = 0.0
+        self.beat_times  = np.array(beat_times)
+        self.next_beat_i = 0
+        self.hits        = []
+        self.prev_coords = None
 
-    def update(self, current_sec: float, coords_you) -> float:
+    def update(self, current_sec, coords_you):
         velocity = 0.0
-        if self.prev_coords is not None and coords_you is not None:
+        if self.prev_coords and coords_you:
             for idx in KEY_LM:
                 if idx in coords_you and idx in self.prev_coords:
-                    velocity += float(np.linalg.norm(
-                        coords_you[idx] - self.prev_coords[idx]))
-        self.prev_coords   = coords_you
-        self.last_velocity = velocity
-
+                    velocity += float(np.linalg.norm(coords_you[idx] - self.prev_coords[idx]))
+        self.prev_coords = coords_you
         if len(self.beat_times) and self.next_beat_i < len(self.beat_times):
-            bt = self.beat_times[self.next_beat_i]
-            if current_sec > bt + BEAT_WINDOW:
+            if current_sec > self.beat_times[self.next_beat_i] + BEAT_WINDOW:
                 self.hits.append(velocity > VELOCITY_THRESH)
                 self.next_beat_i += 1
-                self.beat_flash = 0.25
-
-        if self.beat_flash > 0:
-            self.beat_flash -= 1/30
-
-        return velocity
 
     def score(self) -> float:
-        if not self.hits:
-            return 0.0
-        return sum(self.hits) / len(self.hits) * 100
+        return sum(self.hits) / len(self.hits) * 100 if self.hits else 0.0
 
     def reset(self, beat_times):
         self.__init__(beat_times)
@@ -249,251 +215,161 @@ class SessionTracker:
         self.coach_until  = 0.0
         self.coach_pending = False
 
-    def update(self, instant_score, coords_ref, coords_you):
-        self.pose_scores.append(instant_score)
+    def update(self, instant, coords_ref, coords_you):
+        self.pose_scores.append(instant)
         if coords_ref and coords_you:
             for idx in KEY_LM:
                 if idx in coords_ref and idx in coords_you:
-                    d = float(np.linalg.norm(coords_you[idx] - coords_ref[idx]))
-                    self.joint_errors[idx].append(d)
+                    self.joint_errors[idx].append(
+                        float(np.linalg.norm(coords_you[idx] - coords_ref[idx])))
 
-    def avg_score(self) -> float:
-        return float(np.mean(self.pose_scores)) if self.pose_scores else 0.0
-
+    def avg_score(self): return float(np.mean(self.pose_scores)) if self.pose_scores else 0.0
     def worst_joints(self, n=3):
         avgs = {lm: float(np.mean(v)) for lm, v in self.joint_errors.items() if v}
         return sorted(avgs.items(), key=lambda x: x[1], reverse=True)[:n]
+    def duration(self): return time.time() - self.start
 
-    def duration(self) -> float:
-        return time.time() - self.start
+# ── AI coach ───────────────────────────────────────────────────────────────────
 
-# ── AI coach (Ollama) ──────────────────────────────────────────────────────────
-
-def request_coaching(session: SessionTracker, rhythm: RhythmTracker, on_done):
+def request_coaching(session, rhythm, on_done):
     if not OLLAMA_OK:
-        on_done(["AI coach unavailable — run: pip install ollama"])
-        return
-    if session.coach_pending:
-        return
+        on_done(["AI coach unavailable — pip install ollama"]); return
+    if session.coach_pending: return
     session.coach_pending = True
 
     def _call():
         try:
             worst = session.worst_joints(3)
-            worst_str = ", ".join(
-                f"{LM_NAMES.get(lm, lm)} ({err:.2f})" for lm, err in worst
-            ) or "none identified"
-
-            prompt = f"""You are an enthusiastic dance coach giving feedback after a practice run.
-
-Student stats:
-- Pose accuracy: {session.avg_score():.1f}%
-- Rhythm accuracy: {rhythm.score():.1f}%
-- Body parts needing most work: {worst_str}
-- Duration: {session.duration():.0f}s
-
-Give exactly 3 short coaching tips (1 sentence each). Be specific, positive, and actionable. No bullet symbols, no numbering — just 3 plain sentences separated by newlines."""
-
-            resp = _ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = resp["message"]["content"].strip()
-            lines = [l.strip() for l in text.split("\n") if l.strip()][:3]
+            worst_str = ", ".join(f"{LM_NAMES.get(lm)} ({e:.2f})" for lm, e in worst) or "none"
+            prompt = (f"You are a dance coach. Stats: pose {session.avg_score():.1f}%, "
+                      f"rhythm {rhythm.score():.1f}%, worst joints: {worst_str}, "
+                      f"duration {session.duration():.0f}s. "
+                      f"Give 3 short coaching tips, one sentence each, plain text, newline-separated.")
+            resp  = _ollama.chat(model=OLLAMA_MODEL, messages=[{"role":"user","content":prompt}])
+            lines = [l.strip() for l in resp["message"]["content"].strip().split("\n") if l.strip()][:3]
         except Exception as e:
-            lines = [f"Coach error: {e}",
-                     "Make sure Ollama is running: ollama serve",
-                     f"And model is pulled: ollama pull {OLLAMA_MODEL}"]
-
+            lines = [f"Coach error: {e}"]
         session.coach_pending = False
         on_done(lines)
 
     threading.Thread(target=_call, daemon=True).start()
 
-# ── Drawing ────────────────────────────────────────────────────────────────────
+# ── Skeleton drawing (OpenCV, on BGR frames) ───────────────────────────────────
 
-def _joint_color(dist: float):
+def _jcolor(dist: float):
     t = min(dist / (POSE_THRESHOLD * 2), 1.0)
-    return (0, int(200*(1-t)), int(220*t))   # BGR green→red
-
+    return (0, int(200*(1-t)), int(220*t))
 
 def draw_skeleton(frame, landmarks, coords_you=None, coords_ref=None):
-    """
-    Draw skeleton on frame.
-    If coords_you and coords_ref provided: colour joints by per-joint deviation.
-    Otherwise: flat cyan (reference style).
-    """
-    if landmarks is None:
-        return
-
+    if landmarks is None: return
     h, w = frame.shape[:2]
+    def pt(idx): return (int(landmarks[idx].x * w), int(landmarks[idx].y * h))
 
-    def pt(idx):
-        return (int(landmarks[idx].x * w), int(landmarks[idx].y * h))
-
-    # Connections
     for a, b in BODY_CONNECTIONS:
-        if landmarks[a].visibility > 0.3 and landmarks[b].visibility > 0.3:
-            if coords_you and coords_ref:
-                da = np.linalg.norm(coords_you.get(a, 0) - coords_ref.get(a, 0)) if a in coords_you and a in coords_ref else 0
-                db = np.linalg.norm(coords_you.get(b, 0) - coords_ref.get(b, 0)) if b in coords_you and b in coords_ref else 0
-                color = tuple(int(x) for x in (np.array(_joint_color(da)) + np.array(_joint_color(db))) // 2)
-                thickness = 6
-            else:
-                color  = (200, 200, 0)   # cyan-ish for reference
-                thickness = 4
-            cv2.line(frame, pt(a), pt(b), color, thickness)
-
-    # Joints
-    for idx in KEY_LM:
-        if landmarks[idx].visibility < 0.3:
-            continue
-        if coords_you and coords_ref and idx in coords_you and idx in coords_ref:
-            dist  = float(np.linalg.norm(coords_you[idx] - coords_ref[idx]))
-            color = _joint_color(dist)
-            radius = 14
+        if landmarks[a].visibility < 0.3 or landmarks[b].visibility < 0.3: continue
+        if coords_you and coords_ref:
+            da = float(np.linalg.norm(coords_you.get(a,np.zeros(2)) - coords_ref.get(a,np.zeros(2))))
+            db = float(np.linalg.norm(coords_you.get(b,np.zeros(2)) - coords_ref.get(b,np.zeros(2))))
+            color = tuple(int(x) for x in (np.array(_jcolor(da)) + np.array(_jcolor(db))) // 2)
+            thick = 6
         else:
-            color  = (0, 220, 220)
-            radius = 10
+            color, thick = (200, 200, 0), 4
+        cv2.line(frame, pt(a), pt(b), color, thick)
+
+    for idx in KEY_LM:
+        if landmarks[idx].visibility < 0.3: continue
+        if coords_you and coords_ref:
+            dist = float(np.linalg.norm(
+                coords_you.get(idx, np.zeros(2)) - coords_ref.get(idx, np.zeros(2))))
+            color, radius = _jcolor(dist), 14
+        else:
+            color, radius = (0, 220, 220), 10
         cv2.circle(frame, pt(idx), radius, color, -1)
         cv2.circle(frame, pt(idx), radius, (255, 255, 255), 2)
 
+# ── Pygame helpers ─────────────────────────────────────────────────────────────
 
-def _score_color(pct: float):
-    t = pct / 100
-    return (0, int(200*t), int(220*(1-t)))
+def bgr_to_surface(bgr, w, h):
+    """Convert a BGR OpenCV frame to a pygame Surface at size (w, h)."""
+    frame = cv2.resize(bgr, (w, h))
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return pygame.surfarray.make_surface(np.rot90(frame))
 
+def draw_label(screen, font, text, x, y, color):
+    shadow = font.render(text, True, (0, 0, 0))
+    label  = font.render(text, True, color)
+    screen.blit(shadow, (x+2, y+2))
+    screen.blit(label,  (x,   y))
 
-def draw_hud(canvas, pose_smooth, pose_instant, rhythm_pct,
-             beat_flash, tempo_bpm, coach_lines, coach_until):
-    h, w = canvas.shape[:2]
-
-    def score_bar(label, pct, by):
-        bw = int(w * 0.68)
-        bx = (w - bw) // 2
-        bh = 18
-        cv2.rectangle(canvas, (bx, by), (bx+bw, by+bh), (30,30,30), -1)
-        fw = max(0, int(bw * pct / 100))
-        if fw:
-            cv2.rectangle(canvas, (bx, by), (bx+fw, by+bh), _score_color(pct), -1)
-        cv2.rectangle(canvas, (bx, by), (bx+bw, by+bh), (160,160,160), 2)
-        cv2.putText(canvas, label, (bx, by-8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (230,230,230), 2)
-        return bx, bw
-
-    bx, bw = score_bar(
-        f"Pose  {pose_smooth:5.1f}%   (instant {pose_instant:5.1f}%)",
-        pose_smooth, h-88)
-
-    bpm_str = f"  {tempo_bpm:.0f} BPM" if tempo_bpm else ""
-    score_bar(f"Rhythm {rhythm_pct:5.1f}%{bpm_str}", rhythm_pct, h-48)
-
-    # Beat flash dot
-    if beat_flash > 0:
-        alpha = min(beat_flash / 0.25, 1.0)
-        cx = bx + bw + 18
-        cv2.circle(canvas, (cx, h-48+9), 10,
-                   (int(50*alpha), int(220*alpha), int(220*alpha)), -1)
-
-    # Coach overlay
-    if coach_lines and time.time() < coach_until:
-        lh2, pad = 26, 12
-        box_h = pad*2 + lh2*(len(coach_lines)+1)
-        box_x, box_y = 30, (h - box_h)//2 - 20
-        box_w = w - 60
-        overlay = canvas.copy()
-        cv2.rectangle(overlay, (box_x, box_y),
-                      (box_x+box_w, box_y+box_h), (10,10,10), -1)
-        cv2.addWeighted(overlay, 0.78, canvas, 0.22, 0, canvas)
-        cv2.putText(canvas, "AI Coach", (box_x+pad, box_y+22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,200,255), 2)
-        for i, line in enumerate(coach_lines):
-            cv2.putText(canvas, line, (box_x+pad, box_y+pad+lh2*(i+2)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (240,240,240), 1)
-
-
-def add_label(frame, text, color):
-    cv2.putText(frame, text, (12,35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,0), 4)
-    cv2.putText(frame, text, (12,35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color,  2)
+def draw_coach_overlay(screen, font_big, font_sm, lines, coach_until, total_w, total_h):
+    if not lines or time.time() >= coach_until:
+        return
+    pad, lh = 14, 28
+    box_h = pad*2 + lh*(len(lines)+1)
+    box_x, box_y = 40, (total_h - box_h) // 2 - 20
+    box_w = total_w - 80
+    overlay = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+    overlay.fill((10, 10, 10, 200))
+    screen.blit(overlay, (box_x, box_y))
+    title = font_big.render("AI Coach", True, (0, 200, 255))
+    screen.blit(title, (box_x + pad, box_y + pad))
+    for i, line in enumerate(lines):
+        txt = font_sm.render(line, True, (240, 240, 240))
+        screen.blit(txt, (box_x + pad, box_y + pad + lh*(i+2)))
 
 # ── Audio pose cues ────────────────────────────────────────────────────────────
 
 def check_pose_cues(coords_ref, coords_you):
-    if not coords_ref or not coords_you:
-        return
-
-    def dy(idx):
-        return float(coords_ref[idx][1] - coords_you[idx][1])
-    def dx(idx):
-        return float(coords_ref[idx][0] - coords_you[idx][0])
-
+    if not coords_ref or not coords_you: return
+    def dy(idx): return float(coords_ref[idx][1] - coords_you[idx][1])
+    def dx(idx): return float(coords_ref[idx][0] - coords_you[idx][0])
     T = POSE_THRESHOLD
-    checks = [
-        (dy(L_WRIST) >  T, "Left arm higher!",     "la_up"),
-        (dy(L_WRIST) < -T, "Left arm lower!",      "la_dn"),
-        (dy(R_WRIST) >  T, "Right arm higher!",    "ra_up"),
-        (dy(R_WRIST) < -T, "Right arm lower!",     "ra_dn"),
-        (dx(L_WRIST) >  T, "Extend your left arm!", "la_out"),
-        (dx(L_WRIST) < -T, "Bring left arm in!",   "la_in"),
-        (dx(R_WRIST) >  T, "Bring right arm in!",  "ra_in"),
-        (dx(R_WRIST) < -T, "Extend right arm!",    "ra_out"),
-        (dy(L_KNEE)  >  T, "Bend your left knee!", "lk"),
-        (dy(R_KNEE)  >  T, "Bend your right knee!","rk"),
-    ]
-    for condition, message, key in checks:
-        if condition:
-            speak(message, key)
-            break
+    for cond, msg, key in [
+        (dy(L_WR) >  T, "Left arm higher!",     "la_up"),
+        (dy(L_WR) < -T, "Left arm lower!",      "la_dn"),
+        (dy(R_WR) >  T, "Right arm higher!",    "ra_up"),
+        (dy(R_WR) < -T, "Right arm lower!",     "ra_dn"),
+        (dx(L_WR) >  T, "Extend left arm!",     "la_out"),
+        (dx(L_WR) < -T, "Bring left arm in!",   "la_in"),
+        (dx(R_WR) >  T, "Bring right arm in!",  "ra_in"),
+        (dx(R_WR) < -T, "Extend right arm!",    "ra_out"),
+        (dy(L_KN) >  T, "Bend left knee!",      "lk"),
+        (dy(R_KN) >  T, "Bend right knee!",     "rk"),
+    ]:
+        if cond: speak(msg, key); break
 
-# ── Video download ─────────────────────────────────────────────────────────────
+# ── Video download / cache ─────────────────────────────────────────────────────
 
 def resolve_video(source: str) -> str:
     if not source.startswith("http"):
         return source
     if not YTDLP_OK:
-        sys.exit("[ERROR] yt-dlp not installed. Run: pip install yt-dlp")
-
-    # Cache downloads in the project folder so we don't re-download each run
+        sys.exit("[ERROR] pip install yt-dlp")
+    import hashlib
     cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
     os.makedirs(cache_dir, exist_ok=True)
-    import hashlib
-    url_hash  = hashlib.md5(source.encode()).hexdigest()[:10]
-    cached    = os.path.join(cache_dir, f"{url_hash}.mp4")
+    url_hash = hashlib.md5(source.encode()).hexdigest()[:10]
+    cached   = os.path.join(cache_dir, f"{url_hash}.mp4")
     if os.path.exists(cached):
-        print(f"Using cached video: {cached}")
-        return cached
-
-    out_dir  = cache_dir
-    out_tmpl = os.path.join(out_dir, f"{url_hash}.%(ext)s")
-    opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "outtmpl": out_tmpl,
-        "quiet": True,
-        "merge_output_format": "mp4",
-    }
+        print(f"Using cached video: {cached}"); return cached
+    out_tmpl = os.path.join(cache_dir, f"{url_hash}.%(ext)s")
+    opts = {"format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "outtmpl": out_tmpl, "quiet": True, "merge_output_format": "mp4"}
     print(f"Downloading: {source}")
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(source, download=True)
         path = ydl.prepare_filename(info)
-        for ext in (".webm", ".mkv"):
-            path = path.replace(ext, ".mp4")
+        for ext in (".webm", ".mkv"): path = path.replace(ext, ".mp4")
     if not os.path.exists(path):
-        for f in os.listdir(out_dir):
-            candidate = os.path.join(out_dir, f)
-            if url_hash in f:
-                path = candidate; break
-    print(f"Saved to: {path}")
-    return path
+        for f in os.listdir(cache_dir):
+            if url_hash in f: path = os.path.join(cache_dir, f); break
+    print(f"Saved to: {path}"); return path
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(source: str):
     if not os.path.exists(MODEL_PATH):
-        sys.exit(f"[ERROR] Pose model not found at {MODEL_PATH}\n"
-                 "Run: python -c \"import urllib.request; "
-                 "urllib.request.urlretrieve('https://storage.googleapis.com/"
-                 "mediapipe-models/pose_landmarker/pose_landmarker_lite/"
-                 "float16/1/pose_landmarker_lite.task', 'pose_landmarker_lite.task')\"")
+        sys.exit(f"[ERROR] Model not found: {MODEL_PATH}")
 
     video_path = resolve_video(source)
 
@@ -505,134 +381,135 @@ def main(source: str):
     video_fps = cap_vid.get(cv2.CAP_PROP_FPS) or 30.0
     video_w   = int(cap_vid.get(cv2.CAP_PROP_FRAME_WIDTH))
     video_h   = int(cap_vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    panel_w   = int(video_w * DISPLAY_H / video_h)
-    cam_panel_w = int(DISPLAY_H * 9 / 16)   # webcam shown at 9:16
+    ref_panel_w = int(video_w * DISPLAY_H / video_h)
+    cam_panel_w = int(DISPLAY_H * 9 / 16)
+    total_w     = ref_panel_w + 4 + cam_panel_w
 
-    beat_times, tempo_bpm = load_beats(video_path)
+    beat_times, _ = load_beats(video_path)
     rhythm  = RhythmTracker(beat_times)
     session = SessionTracker()
-
-    score_hist  = deque(maxlen=SCORE_SMOOTH)
-    paused      = False
-    frame_vid   = None
-    video_start = None   # wall-clock time when video started (for frame sync)
-    TARGET_FPS  = 30
-    frame_dur   = 1.0 / TARGET_FPS
-    next_frame  = time.time()
+    score_hist = deque(maxlen=SCORE_SMOOTH)
 
     print("Creating pose detectors ...")
     det_vid = make_detector()
     det_cam = make_detector()
     print("Ready.\n")
-    print("Dance Mirror —  q: quit   r: restart   p: pause   c: AI coach\n")
+
+    # ── Pygame init (same pattern as flappy bird) ──────────────────────────────
+    pygame.init()
+    screen = pygame.display.set_mode((total_w, DISPLAY_H))
+    pygame.display.set_caption("Dance Mirror")
+    clock  = pygame.time.Clock()
+    font_big = pygame.font.Font(None, 36)
+    font_sm  = pygame.font.Font(None, 26)
+
+    paused      = False
+    frame_vid   = None
+    video_start = None
 
     def on_coach_done(lines):
         session.coach_lines = lines
         session.coach_until = time.time() + COACH_DISPLAY_SEC
         speak(". ".join(lines), "coach")
 
-    while True:
+    print("Dance Mirror —  q/ESC: quit   r: restart   p: pause   c: AI coach\n")
+
+    running = True
+    while running:
+        # ── Events ─────────────────────────────────────────────────────────────
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+                elif event.key == pygame.K_r:
+                    cap_vid.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    score_hist.clear()
+                    rhythm.reset(beat_times)
+                    video_start = None
+                    paused = False
+                elif event.key == pygame.K_p:
+                    paused = not paused
+                elif event.key == pygame.K_c:
+                    request_coaching(session, rhythm, on_coach_done)
+
         # ── Webcam ─────────────────────────────────────────────────────────────
         ret_w, raw = cap_cam.read()
         if not ret_w: break
         frame_cam = cv2.flip(raw, 1)
 
-        # ── Dance video (wall-clock sync to avoid slow-motion) ─────────────────
+        # ── Dance video (wall-clock sync) ───────────────────────────────────────
         if not paused:
             if video_start is None:
                 video_start = time.time()
-            # Seek to the frame that matches real elapsed time
-            elapsed = time.time() - video_start
-            target_frame = int(elapsed * video_fps)
-            cap_vid.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            target = int((time.time() - video_start) * video_fps)
+            cap_vid.set(cv2.CAP_PROP_POS_FRAMES, target)
             ret_v, frame_vid = cap_vid.read()
             if not ret_v:
                 cap_vid.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                score_hist.clear()
-                rhythm.reset(beat_times)
-                video_start = None
+                score_hist.clear(); rhythm.reset(beat_times); video_start = None
                 continue
 
         current_sec = cap_vid.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        # ── Pose detection (parallel + downscaled for speed) ────────────────────
+        # ── Pose detection (parallel, downscaled) ───────────────────────────────
         DETECT_W = 640
         def prep(bgr):
             h, w = bgr.shape[:2]
-            small = cv2.resize(bgr, (DETECT_W, int(h * DETECT_W / w)))
-            return cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            s = cv2.resize(bgr, (DETECT_W, int(h * DETECT_W / w)))
+            return cv2.cvtColor(s, cv2.COLOR_BGR2RGB)
 
         with ThreadPoolExecutor(max_workers=2) as ex:
-            fut_vid = ex.submit(detect, det_vid, prep(frame_vid))
-            fut_cam = ex.submit(detect, det_cam, prep(frame_cam))
-            lm_vid  = fut_vid.result()
-            lm_cam  = fut_cam.result()
+            fv = ex.submit(detect, det_vid, prep(frame_vid))
+            fc = ex.submit(detect, det_cam, prep(frame_cam))
+            lm_vid, lm_cam = fv.result(), fc.result()
 
         vec_ref, coords_ref = normalise(lm_vid)
         vec_you, coords_you = normalise(lm_cam)
 
-        # ── Scores ──────────────────────────────────────────────────────────────
         instant = best_pose_score(vec_ref, vec_you)
         score_hist.append(instant)
-        smoothed = float(np.mean(score_hist)) if score_hist else 0.0
+        session.update(instant, coords_ref, coords_you)
 
         if not paused:
             rhythm.update(current_sec, coords_you)
 
-        session.update(instant, coords_ref, coords_you)
         check_pose_cues(coords_ref, coords_you)
 
-        # ── Draw ────────────────────────────────────────────────────────────────
-        draw_skeleton(frame_vid, lm_vid)                                   # reference: cyan
-        draw_skeleton(frame_cam, lm_cam, coords_you, coords_ref)           # you: colour-coded
+        # ── Draw skeletons onto frames (OpenCV) ─────────────────────────────────
+        draw_skeleton(frame_vid, lm_vid)
+        draw_skeleton(frame_cam, lm_cam, coords_you, coords_ref)
 
-        ref_panel = cv2.resize(frame_vid, (panel_w, DISPLAY_H))
-        you_panel = cv2.resize(frame_cam, (cam_panel_w, DISPLAY_H))   # 9:16
+        # ── Convert frames → pygame surfaces ───────────────────────────────────
+        screen.fill((20, 20, 20))
+        ref_surf = bgr_to_surface(frame_vid, ref_panel_w, DISPLAY_H)
+        cam_surf = bgr_to_surface(frame_cam, cam_panel_w, DISPLAY_H)
+        screen.blit(ref_surf, (0, 0))
+        screen.blit(cam_surf, (ref_panel_w + 4, 0))
 
-        add_label(ref_panel, "Dance Reference", (0, 220, 220))
-        add_label(you_panel, "You",              (0, 220,  80))
+        # ── Labels ─────────────────────────────────────────────────────────────
+        draw_label(screen, font_big, "Dance Reference", 12, 10, (0, 220, 220))
+        draw_label(screen, font_big, "You", ref_panel_w + 16, 10, (0, 220, 80))
 
         if paused:
-            cv2.putText(ref_panel, "PAUSED", (panel_w//2-65, DISPLAY_H//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,80,255), 3)
+            txt = font_big.render("PAUSED", True, (0, 80, 255))
+            screen.blit(txt, (ref_panel_w // 2 - txt.get_width() // 2, DISPLAY_H // 2))
 
-        divider = np.full((DISPLAY_H, 4, 3), 80, dtype=np.uint8)
-        combined = np.hstack([ref_panel, divider, you_panel])
+        # ── AI coach overlay ────────────────────────────────────────────────────
+        draw_coach_overlay(screen, font_big, font_sm,
+                           session.coach_lines, session.coach_until,
+                           total_w, DISPLAY_H)
 
-        draw_hud(combined, smoothed, instant,
-                 rhythm.score(), rhythm.beat_flash, tempo_bpm,
-                 session.coach_lines, session.coach_until)
+        pygame.display.flip()
+        clock.tick(TARGET_FPS)   # same as flappy bird
 
-        cv2.imshow("Dance Mirror", combined)
-
-        # ── Keys ─────────────────────────────────────────────────────────────
-        # ── Frame rate limiter (30 fps, same as pose model) ───────────────────
-        now = time.time()
-        sleep_ms = max(1, int((next_frame - now) * 1000))
-        next_frame += frame_dur
-
-        key = cv2.waitKey(sleep_ms) & 0xFF
-        if   key == ord('q'): break
-        elif key == ord('r'):
-            cap_vid.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            score_hist.clear()
-            rhythm.reset(beat_times)
-            video_start = None
-            paused = False
-        elif key == ord('p'):
-            paused = not paused
-        elif key == ord('c'):
-            request_coaching(session, rhythm, on_coach_done)
-
-    # ── Auto-fire coach on exit ─────────────────────────────────────────────
+    # ── Cleanup ────────────────────────────────────────────────────────────────
     request_coaching(session, rhythm,
                      lambda lines: print("\nCoach:\n" + "\n".join(lines)))
-
-    det_vid.close()
-    det_cam.close()
-    cap_vid.release()
-    cap_cam.release()
-    cv2.destroyAllWindows()
+    det_vid.close(); det_cam.close()
+    cap_vid.release(); cap_cam.release()
+    pygame.quit()
 
 
 if __name__ == "__main__":
