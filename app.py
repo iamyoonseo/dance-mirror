@@ -317,11 +317,18 @@ def draw_skeleton(frame, landmarks, coords_you=None, coords_ref=None):
 
 # ── Pygame helpers ─────────────────────────────────────────────────────────────
 
-def bgr_to_surface(bgr, w, h):
-    """Convert a BGR OpenCV frame to a pygame Surface at size (w, h)."""
-    frame = cv2.resize(bgr, (w, h))
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return pygame.surfarray.make_surface(np.rot90(frame))
+def frames_to_surface(ref_bgr, cam_bgr, ref_w, cam_w, h, divider_w=4):
+    """
+    Combine both frames into one numpy array, do a single RGB conversion,
+    and return one pygame Surface — much faster than two separate conversions.
+    """
+    ref = cv2.resize(ref_bgr, (ref_w, h))
+    cam = cv2.resize(cam_bgr, (cam_w, h))
+    div = np.full((h, divider_w, 3), 80, dtype=np.uint8)
+    combined = np.hstack([ref, div, cam])          # one contiguous array
+    rgb = cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
+    total_w = ref_w + divider_w + cam_w
+    return pygame.image.frombuffer(rgb.tobytes(), (total_w, h), 'RGB')
 
 def draw_label(screen, font, text, x, y, color):
     shadow = font.render(text, True, (0, 0, 0))
@@ -505,12 +512,9 @@ def main(source: str):
         draw_skeleton(frame_vid, lm_vid)
         draw_skeleton(frame_cam, lm_cam, coords_you, coords_ref)
 
-        # ── Convert frames → pygame surfaces ───────────────────────────────────
-        screen.fill((20, 20, 20))
-        ref_surf = bgr_to_surface(frame_vid, ref_panel_w, DISPLAY_H)
-        cam_surf = bgr_to_surface(frame_cam, cam_panel_w, DISPLAY_H)
-        screen.blit(ref_surf, (0, 0))
-        screen.blit(cam_surf, (ref_panel_w + 4, 0))
+        # ── Convert both frames → one pygame surface (single conversion) ───────
+        surf = frames_to_surface(frame_vid, frame_cam, ref_panel_w, cam_panel_w, DISPLAY_H)
+        screen.blit(surf, (0, 0))
 
         # ── Labels ─────────────────────────────────────────────────────────────
         draw_label(screen, font_big, "Dance Reference", 12, 10, (0, 220, 220))
