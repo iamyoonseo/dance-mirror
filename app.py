@@ -62,6 +62,33 @@ def make_detector():
 
 DETECT_W = 640   # downscale before detection for speed
 
+class WebcamBuffer:
+    """Reads webcam frames in a background thread — render loop never blocks on camera I/O."""
+    def __init__(self, index=0, w=640, h=480):
+        cap = cv2.VideoCapture(index)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        self._cap   = cap
+        self._frame = None
+        self._lock  = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            ret, frame = self._cap.read()
+            if ret:
+                frame = cv2.flip(frame, 1)
+                with self._lock:
+                    self._frame = frame
+
+    def get(self):
+        with self._lock:
+            return self._frame
+
+    def release(self):
+        self._cap.release()
+
 class AsyncDetector:
     """
     Runs pose detection in a background thread.
@@ -409,9 +436,8 @@ def main(source: str):
     video_path = resolve_video(source)
 
     cap_vid = cv2.VideoCapture(video_path)
-    cap_cam = cv2.VideoCapture(0)
     if not cap_vid.isOpened(): sys.exit(f"[ERROR] Cannot open: {video_path}")
-    if not cap_cam.isOpened(): sys.exit("[ERROR] Cannot open webcam")
+    cam_buf = WebcamBuffer(index=0, w=640, h=480)
 
     video_fps = cap_vid.get(cv2.CAP_PROP_FPS) or 30.0
     video_w   = int(cap_vid.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -469,10 +495,11 @@ def main(source: str):
                 elif event.key == pygame.K_c:
                     request_coaching(session, rhythm, on_coach_done)
 
-        # ── Webcam ─────────────────────────────────────────────────────────────
-        ret_w, raw = cap_cam.read()
-        if not ret_w: break
-        frame_cam = cv2.flip(raw, 1)
+        # ── Webcam (non-blocking — always latest frame from background thread) ──
+        frame_cam = cam_buf.get()
+        if frame_cam is None:
+            clock.tick(TARGET_FPS)
+            continue
 
         # ── Dance video (natural playback + frame-skip to stay in sync) ────────
         if not paused:
@@ -534,7 +561,7 @@ def main(source: str):
     # ── Cleanup ────────────────────────────────────────────────────────────────
     request_coaching(session, rhythm,
                      lambda lines: print("\nCoach:\n" + "\n".join(lines)))
-    cap_vid.release(); cap_cam.release()
+    cap_vid.release(); cam_buf.release()
     pygame.quit()
 
 
