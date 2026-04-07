@@ -13,9 +13,8 @@ Controls:
     c        request AI coach feedback
 """
 
-import sys, os, time, threading, subprocess
+import sys, os, time, threading, subprocess, queue
 from collections import deque, defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -61,17 +60,46 @@ def make_detector():
     )
     return PoseLandmarker.create_from_options(opts)
 
-_ts_lock = threading.Lock()
-_ts_ms   = 0
+DETECT_W = 640   # downscale before detection for speed
 
-def detect(detector, rgb_frame):
-    global _ts_ms
-    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-    with _ts_lock:
-        _ts_ms += 33
-        ts = _ts_ms
-    result = detector.detect_for_video(mp_img, ts)
-    return result.pose_landmarks[0] if result.pose_landmarks else None
+class AsyncDetector:
+    """
+    Runs pose detection in a background thread.
+    The render loop submits frames and reads the latest result without blocking.
+    """
+    def __init__(self, detector):
+        self.detector  = detector
+        self.in_q      = queue.Queue(maxsize=1)
+        self._lm       = None
+        self._vec      = None
+        self._coords   = None
+        self._lock     = threading.Lock()
+        self._ts       = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            rgb = self.in_q.get()
+            self._ts += 33
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.detector.detect_for_video(mp_img, self._ts)
+            lm = result.pose_landmarks[0] if result.pose_landmarks else None
+            vec, coords = normalise(lm)
+            with self._lock:
+                self._lm, self._vec, self._coords = lm, vec, coords
+
+    def submit(self, bgr):
+        h, w = bgr.shape[:2]
+        small = cv2.resize(bgr, (DETECT_W, int(h * DETECT_W / w)))
+        rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        try:
+            self.in_q.put_nowait(rgb)
+        except queue.Full:
+            pass   # detector is busy — skip this frame, use last result
+
+    def result(self):
+        with self._lock:
+            return self._lm, self._vec, self._coords
 
 # ── Landmark indices ───────────────────────────────────────────────────────────
 L_SH, R_SH = 11, 12
@@ -391,8 +419,8 @@ def main(source: str):
     score_hist = deque(maxlen=SCORE_SMOOTH)
 
     print("Creating pose detectors ...")
-    det_vid = make_detector()
-    det_cam = make_detector()
+    det_vid = AsyncDetector(make_detector())
+    det_cam = AsyncDetector(make_detector())
     print("Ready.\n")
 
     # ── Pygame init (same pattern as flappy bird) ──────────────────────────────
@@ -439,12 +467,17 @@ def main(source: str):
         if not ret_w: break
         frame_cam = cv2.flip(raw, 1)
 
-        # ── Dance video (wall-clock sync) ───────────────────────────────────────
+        # ── Dance video (natural playback + frame-skip to stay in sync) ────────
         if not paused:
             if video_start is None:
                 video_start = time.time()
-            target = int((time.time() - video_start) * video_fps)
-            cap_vid.set(cv2.CAP_PROP_POS_FRAMES, target)
+            elapsed     = time.time() - video_start
+            video_pos   = cap_vid.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            # Skip frames when we fall behind — never seek (too expensive)
+            while elapsed > video_pos + 1.0 / video_fps:
+                ret_v, frame_vid = cap_vid.read()
+                if not ret_v: break
+                video_pos = cap_vid.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
             ret_v, frame_vid = cap_vid.read()
             if not ret_v:
                 cap_vid.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -453,20 +486,11 @@ def main(source: str):
 
         current_sec = cap_vid.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        # ── Pose detection (parallel, downscaled) ───────────────────────────────
-        DETECT_W = 640
-        def prep(bgr):
-            h, w = bgr.shape[:2]
-            s = cv2.resize(bgr, (DETECT_W, int(h * DETECT_W / w)))
-            return cv2.cvtColor(s, cv2.COLOR_BGR2RGB)
-
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fv = ex.submit(detect, det_vid, prep(frame_vid))
-            fc = ex.submit(detect, det_cam, prep(frame_cam))
-            lm_vid, lm_cam = fv.result(), fc.result()
-
-        vec_ref, coords_ref = normalise(lm_vid)
-        vec_you, coords_you = normalise(lm_cam)
+        # ── Pose detection (async — non-blocking) ───────────────────────────────
+        det_vid.submit(frame_vid)
+        det_cam.submit(frame_cam)
+        lm_vid, vec_ref, coords_ref = det_vid.result()
+        lm_cam, vec_you, coords_you = det_cam.result()
 
         instant = best_pose_score(vec_ref, vec_you)
         score_hist.append(instant)
@@ -507,7 +531,6 @@ def main(source: str):
     # ── Cleanup ────────────────────────────────────────────────────────────────
     request_coaching(session, rhythm,
                      lambda lines: print("\nCoach:\n" + "\n".join(lines)))
-    det_vid.close(); det_cam.close()
     cap_vid.release(); cap_cam.release()
     pygame.quit()
 
