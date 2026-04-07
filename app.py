@@ -54,7 +54,7 @@ RunningMode      = mp.tasks.vision.RunningMode
 def make_detector():
     opts = PoseLandmarkerOpts(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
-        running_mode=RunningMode.IMAGE,
+        running_mode=RunningMode.VIDEO,
         num_poses=1,
         min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
@@ -62,12 +62,19 @@ def make_detector():
     )
     return PoseLandmarker.create_from_options(opts)
 
+_detect_ts = 0   # shared monotonic timestamp counter (ms)
+_detect_lock = threading.Lock()
+
 def detect(detector, rgb_frame):
-    """Run pose detection. Returns list of landmarks or None."""
+    """Run pose detection using VIDEO mode with monotonic timestamps."""
+    global _detect_ts
     mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-    result = detector.detect(mp_img)
+    with _detect_lock:
+        _detect_ts += 33   # ~30fps in ms
+        ts = _detect_ts
+    result = detector.detect_for_video(mp_img, ts)
     if result.pose_landmarks:
-        return result.pose_landmarks[0]   # first person
+        return result.pose_landmarks[0]
     return None
 
 # ── Landmark indices (MediaPipe 33-point body model) ──────────────────────────
@@ -509,6 +516,9 @@ def main(source: str):
     paused      = False
     frame_vid   = None
     video_start = None   # wall-clock time when video started (for frame sync)
+    TARGET_FPS  = 30
+    frame_dur   = 1.0 / TARGET_FPS
+    next_frame  = time.time()
 
     print("Creating pose detectors ...")
     det_vid = make_detector()
@@ -596,7 +606,12 @@ def main(source: str):
         cv2.imshow("Dance Mirror", combined)
 
         # ── Keys ─────────────────────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
+        # ── Frame rate limiter (30 fps, same as pose model) ───────────────────
+        now = time.time()
+        sleep_ms = max(1, int((next_frame - now) * 1000))
+        next_frame += frame_dur
+
+        key = cv2.waitKey(sleep_ms) & 0xFF
         if   key == ord('q'): break
         elif key == ord('r'):
             cap_vid.set(cv2.CAP_PROP_POS_FRAMES, 0)
